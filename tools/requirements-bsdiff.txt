@@ -1,0 +1,3 @@
+bsdiff4==1.3.2 \
+    --hash=sha256:5809301f8c5ad7eddb1a9ef9c3307912c4abd6ae5e0e879743bd4eceac6cbb56 \
+    --hash=sha256:128a5a8aa689a11e9df22a7ac70fedb1de987923e03e5c4d8ab342115ba5bfd1

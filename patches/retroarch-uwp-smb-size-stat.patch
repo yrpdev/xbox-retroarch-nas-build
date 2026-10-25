@@ -1,0 +1,29 @@
+--- a/libretro-common/vfs/vfs_implementation_uwp.cpp
++++ b/libretro-common/vfs/vfs_implementation_uwp.cpp
+@@ -385,6 +385,14 @@
+     if (stream->scheme == VFS_SCHEME_SMB)
+     {
+         if (!retro_vfs_file_open_smb(stream, path, mode, hints))
++            goto error;
++
++        /* SMB returns before the native-file size initialization below. */
++        if (retro_vfs_file_seek_smb(stream, 0, SEEK_END) < 0)
++            goto error;
++        stream->size = retro_vfs_file_tell_smb(stream);
++        if (stream->size < 0 ||
++            retro_vfs_file_seek_smb(stream, 0, SEEK_SET) < 0)
+             goto error;
+ 
+         return stream;
+@@ -701,6 +709,11 @@
+    if (!path || !*path)
+       return 0;
+ 
++#ifdef HAVE_SMBCLIENT
++   if (strncmp(path, "smb://", 6) == 0)
++      return retro_vfs_stat_smb(path, size);
++#endif
++
+    path_wide = utf8_to_utf16_string_alloc(path);
+    windowsize_path(path_wide);
+ 

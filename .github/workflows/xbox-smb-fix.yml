@@ -1,0 +1,286 @@
+name: Xbox Series SMB size and stat fix (artifact only)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CL: /D_SILENCE_EXPERIMENTAL_COROUTINE_DEPRECATION_WARNINGS
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 90
+    steps:
+      - name: Use literal source line endings
+        shell: pwsh
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.longpaths true
+      - name: Check out reviewed patch only
+        uses: actions/checkout@v4
+        with:
+          path: review
+          persist-credentials: false
+      - name: Check out exact installed upstream release
+        uses: actions/checkout@v4
+        with:
+          repository: XboxEmulationHub/RetroArch
+          ref: fac75f5d667f2a501c33b52c70e135d6395266dc
+          path: source
+          persist-credentials: false
+      - name: Add MSBuild
+        uses: microsoft/setup-msbuild@v2
+      - name: Add pinned Python interpreter
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          architecture: x64
+      - name: Check build prerequisites and install hash-pinned delta tool
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $vswhere = "${env:ProgramFiles(x86)}/Microsoft Visual Studio/Installer/vswhere.exe"
+          $vs = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 Microsoft.VisualStudio.ComponentGroup.UWP.VC.v142 -property installationPath
+          if (!$vs) { throw 'Required Visual Studio desktop/UWP C++ components are absent' }
+          $sdk = Get-ChildItem "${env:ProgramFiles(x86)}/Windows Kits/10/bin" -Directory | Where-Object { Test-Path (Join-Path $_.FullName 'x64/MakeAppx.exe') } | Sort-Object Name -Descending | Select-Object -First 1
+          if (!$sdk) { throw 'Windows SDK Appx tools are absent' }
+          "MAKEAPPX=$(Join-Path $sdk.FullName 'x64/MakeAppx.exe')" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          if (!(Test-Path source/pkg/msvc-uwp/packages/Microsoft.Windows.CppWinRT.3.0.260520.1/build/native/Microsoft.Windows.CppWinRT.props)) { throw 'Pinned tracked C++/WinRT package is absent' }
+          python -m pip install --disable-pip-version-check --index-url https://pypi.org/simple --only-binary=:all: --require-hashes --no-deps -r review/tools/requirements-bsdiff.txt
+          if ($LASTEXITCODE) { throw 'Pinned bsdiff4 wheel installation failed' }
+          python -m unittest discover -s review/tools -p test_appx_delta.py -v
+          if ($LASTEXITCODE) { throw 'Exact delta helper tests failed' }
+      - name: Apply reviewed SMB patch
+        shell: pwsh
+        working-directory: source
+        run: |
+          $ErrorActionPreference = 'Stop'
+          git apply --check ../review/patches/retroarch-uwp-smb-size-stat.patch
+          if ($LASTEXITCODE) { throw 'Patch check failed' }
+          git apply ../review/patches/retroarch-uwp-smb-size-stat.patch
+          if ($LASTEXITCODE) { throw 'Patch failed' }
+      - name: Reuse exact installed release core and dependency binaries
+        shell: pwsh
+        working-directory: source
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $url = 'https://github.com/XboxEmulationHub/RetroArch/releases/download/08-19-2026/RetroArch-SeriesConsoles-AllCores.appx'
+          curl.exe --fail --location --retry 3 $url --output original.appx
+          if ($LASTEXITCODE) { throw 'Original release download failed' }
+          $expected = '0b327bf6cc4d0b18caa0a0fc2337c96b53920f46bbfd136920e1ed9e5656b00a'
+          if ((Get-FileHash original.appx -Algorithm SHA256).Hash.ToLowerInvariant() -ne $expected) { throw 'Original release hash mismatch' }
+          & $env:MAKEAPPX unpack /p original.appx /d exact-baseline /o
+          if ($LASTEXITCODE) { throw 'Original package extraction failed' }
+          $target = 'pkg/msvc-uwp/RetroArch-msvcUWP/cores/x64'
+          New-Item -ItemType Directory -Force "$target/cores" | Out-Null
+          # MESA files have a second explicit project item group; avoid duplicate package paths.
+          $mesa = 'pkg/msvc-uwp/RetroArch-msvcUWP/MESA/x64'
+          $mesaNames = @(Get-ChildItem $mesa -File -Filter '*.dll' | Select-Object -ExpandProperty Name)
+          foreach ($file in Get-ChildItem exact-baseline -File -Filter '*.dll') {
+            if ($mesaNames -contains $file.Name) { Copy-Item $file.FullName (Join-Path $mesa $file.Name) -Force }
+            else { Copy-Item $file.FullName $target }
+          }
+          Copy-Item exact-baseline/cores/*.dll "$target/cores"
+          Get-ChildItem exact-baseline/cores -Filter '*.lck' | Copy-Item -Destination "$target/cores"
+          # No nightly core downloads: the existing ROM-to-core audit remains valid.
+      - name: Write uwp_assets_init source files
+        shell: pwsh
+        working-directory: source
+        run: |
+          $header = @'
+          #pragma once
+          #ifdef __cplusplus
+          extern "C" {
+          #endif
+          void uwp_init_assets(void);
+          void uwp_check_asset_updates(void);
+          #ifdef __cplusplus
+          }
+          #endif
+          '@
+          $source = @'
+          #include "uwp_assets_init.h"
+          #include <winrt/Windows.Storage.h>
+          #include <winrt/Windows.ApplicationModel.h>
+          #include <winrt/Windows.Foundation.Collections.h>
+          #include <string.h>
+          
+          using namespace winrt::Windows::Storage;
+          using namespace winrt::Windows::ApplicationModel;
+          
+          #ifdef __cplusplus
+          extern "C" {
+          #endif
+          #if defined(HAVE_ONLINE_UPDATER) && defined(HAVE_NETWORKING)
+          extern void menu_trigger_all_online_updates(void);
+          #endif
+          #ifdef __cplusplus
+          }
+          #endif
+          
+          static bool g_needs_update  = false;
+          static int  g_frame_counter = 0;
+          #define ASSET_UPDATE_DELAY 180
+          
+          void uwp_init_assets(void)
+          {
+             try {
+                auto assets = ApplicationData::Current().LocalFolder()
+                   .GetFolderAsync(L"assets").get();
+                auto items = assets.GetItemsAsync().get();
+                if (items.Size() > 0)
+                   return;
+             } catch (...) {}
+             
+             g_needs_update = true;
+          }
+          
+          void uwp_check_asset_updates(void)
+          {
+             if (!g_needs_update)
+                return;
+                
+             g_frame_counter++;
+             if (g_frame_counter < ASSET_UPDATE_DELAY)
+                return;
+                
+             g_needs_update = false;
+             
+          #if defined(HAVE_ONLINE_UPDATER) && defined(HAVE_NETWORKING)
+             menu_trigger_all_online_updates();
+          #endif
+          }
+          '@
+          New-Item -ItemType Directory -Force -Path "uwp"
+          Set-Content -Path "uwp\uwp_assets_init.h" -Value $header
+          Set-Content -Path "uwp\uwp_assets_init.cpp" -Value $source
+      - name: Patch source files and vcxproj
+        shell: pwsh
+        working-directory: source
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # Append a public wrapper to menu_cbs_ok.c that calls the static updater actions
+          $wrapper = @"
+          #if defined(HAVE_ONLINE_UPDATER) && defined(HAVE_NETWORKING)
+          void menu_trigger_all_online_updates(void)
+          {
+             action_ok_update_assets(NULL, NULL, 0, 0, 0);
+             action_ok_update_core_info_files(NULL, NULL, 0, 0, 0);
+             action_ok_update_autoconfig_profiles(NULL, NULL, 0, 0, 0);
+          #ifdef HAVE_CHEATS
+             action_ok_update_cheats(NULL, NULL, 0, 0, 0);
+          #endif
+             action_ok_update_databases(NULL, NULL, 0, 0, 0);
+             action_ok_update_overlays(NULL, NULL, 0, 0, 0);
+          #if defined(HAVE_SLANG)
+             action_ok_update_shaders_slang(NULL, NULL, 0, 0, 0);
+          #endif
+          }
+          #endif
+          "@
+          Add-Content "menu\cbs\menu_cbs_ok.c" $wrapper
+          # Patch uwp_main.cpp using purely literal string replacements
+          $main = Get-Content "uwp\uwp_main.cpp" -Raw
+          
+          foreach ($needle in @('#include "uwp_async.h"', 'if ((ret = rarch_main(', 'task_queue_check();')) {
+            if (!$main.Contains($needle)) { throw "Missing exact upstream insertion point: $needle" }
+          }
+          $main = $main.Replace('#include "uwp_async.h"', "#include `"uwp_async.h`"`r`n#include `"uwp_assets_init.h`"")
+          $main = $main.Replace('if ((ret = rarch_main(', "uwp_init_assets();`r`n   if ((ret = rarch_main(")
+          $main = $main.Replace('task_queue_check();', "task_queue_check();`r`n      uwp_check_asset_updates();")
+          
+          Set-Content "uwp\uwp_main.cpp" $main
+          # Patch vcxproj
+          $vcx = Get-Content "pkg\msvc-UWP\RetroArch-msvcUWP\RetroArch-msvcUWP.vcxproj" -Raw
+          $inject = '<ItemGroup><ClCompile Include="..\..\..\uwp\uwp_assets_init.cpp" /></ItemGroup>'
+          $vcx = $vcx.Replace('</Project>', "$inject`r`n</Project>")
+          Set-Content "pkg\msvc-UWP\RetroArch-msvcUWP\RetroArch-msvcUWP.vcxproj" $vcx
+      - name: Preserve package identity and increment revision
+        shell: pwsh
+        working-directory: source
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $path = 'pkg/msvc-uwp/RetroArch-msvcUWP/Package.appxmanifest'
+          [xml]$m = Get-Content $path -Raw
+          if ($m.Package.Identity.Name -ne '1e4cf179-f3c2-404f-b9f3-cb2070a5aad8' -or $m.Package.Identity.Publisher -ne 'CN=libretro') { throw 'Unexpected upstream identity' }
+          $m.Package.Identity.Version = '1.22.2.1'
+          $m.Save((Join-Path $PWD $path))
+          $key = Join-Path $PWD 'pkg/msvc-uwp/RetroArch-msvcUWP/RetroArch-msvcUWP_TemporaryKey.pfx'
+          $cert = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($key, '')
+          $hash = $cert.GetCertHashString([System.Security.Cryptography.HashAlgorithmName]::SHA256).ToLowerInvariant()
+          if ($hash -ne '881ef621c708e52248b21bc9fa1c4c1c0be603f3f13f0419b6aa6bf5295d1bb2') { throw 'Signing certificate differs from installed release' }
+          $cert.Dispose()
+      - name: Compile one Series x64 package
+        shell: pwsh
+        working-directory: source
+        run: |
+          $ErrorActionPreference = 'Stop'
+          msbuild pkg/msvc-uwp/RetroArch-msvcUWP.sln `
+            /m /p:Configuration=Release /p:Platform=x64 `
+            /p:AppxBundle=Never /p:UapAppxPackageBuildMode=SideloadOnly
+          if ($LASTEXITCODE) { throw 'UWP build failed' }
+      - name: Verify identity and preserved core bytes
+        shell: pwsh
+        working-directory: source
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force ../artifact | Out-Null
+          $package = Get-ChildItem pkg/msvc-uwp/x64/Release -Recurse -Filter '*x64.appx' | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          if (!$package) { throw 'No x64 package produced' }
+          "BUILT_APPX=$($package.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $zip = [System.IO.Compression.ZipFile]::OpenRead($package.FullName)
+          try {
+            $reader = [System.IO.StreamReader]::new($zip.GetEntry('AppxManifest.xml').Open())
+            try { [xml]$manifest = $reader.ReadToEnd() } finally { $reader.Dispose() }
+            $identity = $manifest.Package.Identity
+            if ($identity.Name -ne '1e4cf179-f3c2-404f-b9f3-cb2070a5aad8' -or $identity.Publisher -ne 'CN=libretro' -or $identity.Version -ne '1.22.2.1' -or $identity.ProcessorArchitecture -ne 'x64') { throw 'Output identity mismatch' }
+            $baseline = Resolve-Path exact-baseline
+            $files = @(Get-ChildItem exact-baseline -File -Filter '*.dll') + @(Get-ChildItem exact-baseline/cores -File -Filter '*.dll')
+            foreach ($file in $files) {
+              $name = [System.IO.Path]::GetRelativePath($baseline.Path, $file.FullName).Replace('\', '/')
+              # Appx ZIP part names are URI escaped; native MakeAppx unpack uses filesystem names.
+              $partName = (($name -split '/') | ForEach-Object { [Uri]::EscapeDataString($_) }) -join '/'
+              $entry = $zip.GetEntry($partName)
+              if (!$entry) { throw "Missing exact baseline DLL: $name" }
+              $stream = $entry.Open()
+              $sha = [System.Security.Cryptography.SHA256]::Create()
+              try { $actual = [Convert]::ToHexString($sha.ComputeHash($stream)).ToLowerInvariant() } finally { $stream.Dispose(); $sha.Dispose() }
+              if ($actual -ne (Get-FileHash $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()) { throw "Changed baseline DLL: $name" }
+            }
+            @{ sourceCommit='fac75f5d667f2a501c33b52c70e135d6395266dc'; packageVersion='1.22.2.1'; identityName=$identity.Name; publisher=$identity.Publisher; preservedDllCount=$files.Count; packageSha256=(Get-FileHash $package.FullName -Algorithm SHA256).Hash.ToLowerInvariant(); packageBytes=$package.Length; baselineSha256='0b327bf6cc4d0b18caa0a0fc2337c96b53920f46bbfd136920e1ed9e5656b00a'; signingCertificateSha256='881ef621c708e52248b21bc9fa1c4c1c0be603f3f13f0419b6aa6bf5295d1bb2'; nativeXboxSmokeTest='Required before accepting fix' } | ConvertTo-Json | Set-Content ../artifact/build-review.json
+          } finally { $zip.Dispose() }
+      - name: Create and round-trip verify exact signed package delta
+        shell: pwsh
+        working-directory: source
+        run: |
+          $ErrorActionPreference = 'Stop'
+          python ../review/tools/appx_delta.py create original.appx "$env:BUILT_APPX" ../artifact
+          if ($LASTEXITCODE) { throw 'Delta creation failed; no artifact may be uploaded' }
+          python ../review/tools/appx_delta.py apply original.appx ../artifact ../roundtrip.appx
+          if ($LASTEXITCODE) { throw 'Delta reconstruction failed; no artifact may be uploaded' }
+          $actual = (Get-FileHash ../roundtrip.appx -Algorithm SHA256).Hash
+          if ($actual -ne (Get-FileHash "$env:BUILT_APPX" -Algorithm SHA256).Hash) { throw 'Round-trip hash mismatch' }
+          Remove-Item ../roundtrip.appx
+          Copy-Item ../review/tools/appx_delta.py,../review/tools/requirements-bsdiff.txt,../review/README.md ../artifact
+          Copy-Item ../review/patches/retroarch-uwp-smb-size-stat.patch ../artifact
+          New-Item -ItemType Directory ../artifact/generated-source | Out-Null
+          Copy-Item uwp/uwp_assets_init.h,uwp/uwp_assets_init.cpp ../artifact/generated-source
+          git diff --binary -- libretro-common/vfs/vfs_implementation_uwp.cpp menu/cbs/menu_cbs_ok.c uwp/uwp_main.cpp pkg/msvc-uwp/RetroArch-msvcUWP/RetroArch-msvcUWP.vcxproj pkg/msvc-uwp/RetroArch-msvcUWP/Package.appxmanifest > ../artifact/corresponding-source.patch
+          if ($LASTEXITCODE) { throw 'Source provenance export failed' }
+          Copy-Item ../review/.github/workflows/xbox-smb-fix.yml ../artifact/build-workflow.yml
+          @{ reviewCommit=$env:GITHUB_SHA; upstreamCommit='fac75f5d667f2a501c33b52c70e135d6395266dc'; runnerImage=$env:ImageVersion; runnerOS=$env:RUNNER_OS; originalRelease='https://github.com/XboxEmulationHub/RetroArch/releases/tag/08-19-2026'; workflowRun="https://github.com/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"; deltaTransport='raw ZIP records with pinned bsdiff4 1.3.2'; transportOnly='The reconstructed Appx must match the complete signed CI package SHA256' } | ConvertTo-Json | Set-Content ../artifact/provenance.json
+          $total = (Get-ChildItem ../artifact -File -Recurse | Measure-Object Length -Sum).Sum
+          if ($total -ge 450000000) { throw "Review artifact is $total bytes, beyond the strict 450 MB cap; upload blocked" }
+          if (Get-ChildItem ../artifact -Recurse -Include '*.appx','*.pfx','*.zip') { throw 'Full packages, private-key files and ROM archives are not permitted in the review artifact' }
+      - name: Upload capped delta and review metadata only
+        uses: actions/upload-artifact@v4
+        with:
+          name: RetroArch-Series-SMBFix-review
+          path: artifact/
+          retention-days: 1
+          compression-level: 0
+          if-no-files-found: error
