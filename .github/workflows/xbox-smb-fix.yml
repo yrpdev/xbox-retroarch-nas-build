@@ -228,8 +228,9 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           New-Item -ItemType Directory -Force ../artifact | Out-Null
-          $package = Get-ChildItem pkg/msvc-uwp/x64/Release -Recurse -Filter '*x64.appx' | Sort-Object LastWriteTime -Descending | Select-Object -First 1
-          if (!$package) { throw 'No x64 package produced' }
+          $packages = @(Get-ChildItem pkg/msvc-uwp/AppPackages -Recurse -Filter 'RetroArch-msvcUWP_1.22.2.1_x64.appx')
+          if ($packages.Count -ne 1) { throw "Expected one exact x64 package; found $($packages.Count)" }
+          $package = $packages[0]
           "BUILT_APPX=$($package.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           Add-Type -AssemblyName System.IO.Compression.FileSystem
           $zip = [System.IO.Compression.ZipFile]::OpenRead($package.FullName)
