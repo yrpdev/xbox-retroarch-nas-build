@@ -27,3 +27,102 @@
     path_wide = utf8_to_utf16_string_alloc(path);
     windowsize_path(path_wide);
  
+--- a/tasks/task_content.c
++++ b/tasks/task_content.c
+@@ -1374,6 +1374,52 @@
+          content->elems[idx].attr.i |= BLCK_PERSISTENT;
+    }
+ }
++
++#ifdef __WINRT__
++/* Copy a remote file through the frontend VFS for cores using native I/O.
++ * Keep memory bounded and reject partial reads, writes and failed closes. */
++static bool content_file_copy_vfs_to_cache(const char *src, const char *dst)
++{
++   char buffer[64 * 1024];
++   int64_t remaining, requested, received;
++   bool success = false;
++   RFILE *input = filestream_open(src, RETRO_VFS_FILE_ACCESS_READ,
++         RETRO_VFS_FILE_ACCESS_HINT_NONE);
++   RFILE *output = NULL;
++
++   if (!input)
++      goto cleanup;
++   if ((remaining = filestream_get_size(input)) < 0)
++      goto cleanup;
++   output = filestream_open(dst, RETRO_VFS_FILE_ACCESS_WRITE,
++         RETRO_VFS_FILE_ACCESS_HINT_NONE);
++   if (!output)
++      goto cleanup;
++
++   while (remaining > 0)
++   {
++      requested = remaining < (int64_t)sizeof(buffer)
++            ? remaining : (int64_t)sizeof(buffer);
++      received = filestream_read(input, buffer, requested);
++      if (received <= 0 || received > requested
++            || filestream_write(output, buffer, received) != received)
++         goto cleanup;
++      remaining -= received;
++   }
++   if (filestream_flush(output) != 0)
++      goto cleanup;
++   success = true;
++
++cleanup:
++   if (input && filestream_close(input) != 0)
++      success = false;
++   if (output && filestream_close(output) != 0)
++      success = false;
++   if (!success && output)
++      filestream_delete(dst);
++   return success;
++}
++#endif
+ 
+ /**
+  * content_file_load:
+@@ -1469,7 +1515,12 @@
+ #ifdef __WINRT__
+             /* TODO: When support for the 'actual' VFS is added,
+              * there will need to be some more logic here */
+-            if (   !sys_info->supports_vfs
++            /* Bundled MAME 2003 requests VFS v1 streams but validates
++             * content with its native stat backend before opening it. */
++            if (   (   !sys_info->supports_vfs
++                    || (   strncmp(content_path, "smb://", 6) == 0
++                        && string_is_equal(sys_info->info.library_name,
++                           "MAME 2003 (0.78)")))
+                 && !is_path_accessible_using_standard_io(content_path))
+             {
+                /* Try to copy ACL to file first. If successful, this should mean that cores using standard I/O can still access them
+@@ -1480,7 +1531,8 @@
+                */
+                wchar_t wcontent_path[MAX_PATH];
+                mbstowcs(wcontent_path, content_path, MAX_PATH);
+-               uwp_set_acl(wcontent_path, L"S-1-15-2-1");
++               if (strncmp(content_path, "smb://", 6) != 0)
++                  uwp_set_acl(wcontent_path, L"S-1-15-2-1");
+                if (!is_path_accessible_using_standard_io(content_path))
+                {
+                   wchar_t wnew_path[MAX_PATH];
+@@ -1488,7 +1540,7 @@
+                   char new_basedir[DIR_MAX_LENGTH];
+                   char new_path[PATH_MAX_LENGTH];
+ 
+-                  RARCH_LOG("[Content] Core does not support VFS"
++                  RARCH_LOG("[Content] Core requires a native content path"
+                      " - copying to cache directory...\n");
+ 
+                   if (content_ctx->directory_cache && *content_ctx->directory_cache)
+@@ -1525,7 +1577,9 @@
+                   /* TODO: This may fail on very large files...
+                    * but copying large files is not a good idea anyway
+                    * (This disclaimer is out dated but I don't want to remove it)*/
+-                  if (!CopyFileFromAppW(wcontent_path, wnew_path, false))
++                  if (strncmp(content_path, "smb://", 6) == 0
++                        ? !content_file_copy_vfs_to_cache(content_path, new_path)
++                        : !CopyFileFromAppW(wcontent_path, wnew_path, false))
+                   {
+                      char msg[PATH_MAX_LENGTH];
+                      /* TODO/FIXME - localize */

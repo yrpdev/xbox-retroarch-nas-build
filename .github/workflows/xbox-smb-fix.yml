@@ -1,4 +1,4 @@
-name: Xbox Series SMB size and stat fix (artifact only)
+name: Xbox Series NAS access and cache fix (artifact only)
 
 on:
   workflow_dispatch:
@@ -206,7 +206,7 @@ jobs:
           $path = 'pkg/msvc-uwp/RetroArch-msvcUWP/Package.appxmanifest'
           [xml]$m = Get-Content $path -Raw
           if ($m.Package.Identity.Name -ne '1e4cf179-f3c2-404f-b9f3-cb2070a5aad8' -or $m.Package.Identity.Publisher -ne 'CN=libretro') { throw 'Unexpected upstream identity' }
-          $m.Package.Identity.Version = '1.22.2.1'
+          $m.Package.Identity.Version = '1.22.2.2'
           $m.Save((Join-Path $PWD $path))
           $key = Join-Path $PWD 'pkg/msvc-uwp/RetroArch-msvcUWP/RetroArch-msvcUWP_TemporaryKey.pfx'
           $cert = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($key, '')
@@ -228,7 +228,7 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           New-Item -ItemType Directory -Force ../artifact | Out-Null
-          $packages = @(Get-ChildItem pkg/msvc-uwp/AppPackages -Recurse -Filter 'RetroArch-msvcUWP_1.22.2.1_x64.appx')
+          $packages = @(Get-ChildItem pkg/msvc-uwp/AppPackages -Recurse -Filter 'RetroArch-msvcUWP_1.22.2.2_x64.appx')
           if ($packages.Count -ne 1) { throw "Expected one exact x64 package; found $($packages.Count)" }
           $package = $packages[0]
           "BUILT_APPX=$($package.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
@@ -238,7 +238,7 @@ jobs:
             $reader = [System.IO.StreamReader]::new($zip.GetEntry('AppxManifest.xml').Open())
             try { [xml]$manifest = $reader.ReadToEnd() } finally { $reader.Dispose() }
             $identity = $manifest.Package.Identity
-            if ($identity.Name -ne '1e4cf179-f3c2-404f-b9f3-cb2070a5aad8' -or $identity.Publisher -ne 'CN=libretro' -or $identity.Version -ne '1.22.2.1' -or $identity.ProcessorArchitecture -ne 'x64') { throw 'Output identity mismatch' }
+            if ($identity.Name -ne '1e4cf179-f3c2-404f-b9f3-cb2070a5aad8' -or $identity.Publisher -ne 'CN=libretro' -or $identity.Version -ne '1.22.2.2' -or $identity.ProcessorArchitecture -ne 'x64') { throw 'Output identity mismatch' }
             $baseline = Resolve-Path exact-baseline
             $files = @(Get-ChildItem exact-baseline -File -Filter '*.dll') + @(Get-ChildItem exact-baseline/cores -File -Filter '*.dll')
             foreach ($file in $files) {
@@ -252,7 +252,7 @@ jobs:
               try { $actual = [Convert]::ToHexString($sha.ComputeHash($stream)).ToLowerInvariant() } finally { $stream.Dispose(); $sha.Dispose() }
               if ($actual -ne (Get-FileHash $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()) { throw "Changed baseline DLL: $name" }
             }
-            @{ sourceCommit='fac75f5d667f2a501c33b52c70e135d6395266dc'; packageVersion='1.22.2.1'; identityName=$identity.Name; publisher=$identity.Publisher; preservedDllCount=$files.Count; packageSha256=(Get-FileHash $package.FullName -Algorithm SHA256).Hash.ToLowerInvariant(); packageBytes=$package.Length; baselineSha256='0b327bf6cc4d0b18caa0a0fc2337c96b53920f46bbfd136920e1ed9e5656b00a'; signingCertificateSha256='881ef621c708e52248b21bc9fa1c4c1c0be603f3f13f0419b6aa6bf5295d1bb2'; nativeXboxSmokeTest='Required before accepting fix' } | ConvertTo-Json | Set-Content ../artifact/build-review.json
+            @{ sourceCommit='fac75f5d667f2a501c33b52c70e135d6395266dc'; packageVersion='1.22.2.2'; identityName=$identity.Name; publisher=$identity.Publisher; preservedDllCount=$files.Count; packageSha256=(Get-FileHash $package.FullName -Algorithm SHA256).Hash.ToLowerInvariant(); packageBytes=$package.Length; baselineSha256='0b327bf6cc4d0b18caa0a0fc2337c96b53920f46bbfd136920e1ed9e5656b00a'; signingCertificateSha256='881ef621c708e52248b21bc9fa1c4c1c0be603f3f13f0419b6aa6bf5295d1bb2'; nativeXboxSmokeTest='Required before accepting fix' } | ConvertTo-Json | Set-Content ../artifact/build-review.json
           } finally { $zip.Dispose() }
       - name: Create and round-trip verify exact signed package delta
         shell: pwsh
@@ -270,7 +270,7 @@ jobs:
           Copy-Item ../review/patches/retroarch-uwp-smb-size-stat.patch ../artifact
           New-Item -ItemType Directory ../artifact/generated-source | Out-Null
           Copy-Item uwp/uwp_assets_init.h,uwp/uwp_assets_init.cpp ../artifact/generated-source
-          git diff --binary -- libretro-common/vfs/vfs_implementation_uwp.cpp menu/cbs/menu_cbs_ok.c uwp/uwp_main.cpp pkg/msvc-uwp/RetroArch-msvcUWP/RetroArch-msvcUWP.vcxproj pkg/msvc-uwp/RetroArch-msvcUWP/Package.appxmanifest > ../artifact/corresponding-source.patch
+          git diff --binary -- libretro-common/vfs/vfs_implementation_uwp.cpp tasks/task_content.c menu/cbs/menu_cbs_ok.c uwp/uwp_main.cpp pkg/msvc-uwp/RetroArch-msvcUWP/RetroArch-msvcUWP.vcxproj pkg/msvc-uwp/RetroArch-msvcUWP/Package.appxmanifest > ../artifact/corresponding-source.patch
           if ($LASTEXITCODE) { throw 'Source provenance export failed' }
           Copy-Item ../review/.github/workflows/xbox-smb-fix.yml ../artifact/build-workflow.yml
           @{ reviewCommit=$env:GITHUB_SHA; upstreamCommit='fac75f5d667f2a501c33b52c70e135d6395266dc'; runnerImage=$env:ImageVersion; runnerOS=$env:RUNNER_OS; originalRelease='https://github.com/XboxEmulationHub/RetroArch/releases/tag/08-19-2026'; workflowRun="https://github.com/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"; deltaTransport='raw ZIP records with pinned bsdiff4 1.3.2'; transportOnly='The reconstructed Appx must match the complete signed CI package SHA256' } | ConvertTo-Json | Set-Content ../artifact/provenance.json
